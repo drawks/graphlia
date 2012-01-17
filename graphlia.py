@@ -1,12 +1,12 @@
 #!/usr/bin/env python2.6
 
 from amqplib import client_0_8 as amqp
-from string import translate, maketrans
+from collections import deque
+from string import translate, maketrans, Template
 from xdrlib import Unpacker, Packer
 import ConfigParser
 import SocketServer
 import socket
-import string
 import struct
 import sys
 import threading
@@ -39,12 +39,18 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         packet_type = unpacker.unpack_uint()
         if packet_type == 128:
             self.unpack_meta(unpacker)
+            return
         elif packet_type == 136:
-            self.unpack_metareq(unpacker)
+            #unpack_metareq function works, but serves no purpose right now
+            #commented out unless anyone comes up with a good reason to respond
+            #to metadata requests.
+            #self.unpack_metareq(unpacker)
+            return
         elif 128 < packet_type < 136:
             self.unpack_data(unpacker,packet_type)
+            return
         else:
-            pass
+            return
 
     def unpack_meta(self,unpacker):
         values = {}
@@ -52,7 +58,7 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         if len(values['hostname'].split(':')) == 2:
             (values['hostaddr'],values['hostname']) = values['hostname'].split(':')
         values['metricname'] = unpacker.unpack_string()
-        values['spoof'] = unpacker.unpack_int()
+        values['spoof'] = unpacker.unpack_bool()
         values['metrictype'] = unpacker.unpack_string()
         values['metricname2'] = unpacker.unpack_string()
         values['metricunits'] = unpacker.unpack_string()
@@ -77,26 +83,26 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         if len(values['hostname'].split(':')) == 2:
             (values['hostaddr'],values['hostname']) = values['hostname'].split(':')
         values['metricname'] = unpacker.unpack_string()
-        values['spoof'] = unpacker.unpack_int()
+        values['spoof'] = unpacker.unpack_bool()
         values['format'] = unpacker.unpack_string()
         values['value'] = magic_nums[packet_type](unpacker)
         unpacker.done()
-        if (values['hostname'],values['metricname']) not in mdata_hash:
-            print "Requesting metadata for %s on %s"  % (values['hostname'],values['metricname'])
-            self.send_metareq(values)
+        if values['metricname'] == 'heartbeat':
             return
-        else:
+        elif (values['hostname'],values['metricname']) in mdata_hash:
             values.update(mdata_hash[(values['hostname'],values['metricname'])])
             graphite.record_stat(values)
             return
+        else:
+            print "Requesting metadata for %s on %s"  % (values['hostname'],values['metricname'])
+            self.send_metareq(values)
+            return
 
     def unpack_metareq(self,unpacker):
-        '''Haven't caught one of these yet'''
-        print "BANG!"*16
         values = {}
         values['hostname']=unpacker.unpack_string()
         values['metricname']=unpacker.unpack_string()
-        values['spoof']=unpacker.unpack_int()
+        values['spoof']=unpacker.unpack_bool()
         unpacker.done()
         return
 
@@ -104,18 +110,21 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         sock = self.request[1]
         packer = Packer()
         packer.pack_int(136)
-        packer.pack_string(values['hostname'])
+        if not values['spoof']:
+            packer.pack_string(self.client_address[0])
+        else:
+            packer.pack_string(":".join((self.client_address[0],values['hostname'])))
         packer.pack_string(values['metricname'])
         packer.pack_bool(values['spoof'])
-        sock.sendto(packer.get_buffer(),socket.MSG_EOR,self.client_address)
+        self.server.socket2.sendto(packer.get_buffer(),socket.MSG_EOR,self.server.server_address)
         return
 
 
 class GraphiteAggregator(object):
-    def __init__(self, host, mappings, rates, apply_formats, amqp_conn, amqp_exchange):
+    def __init__(self, host, mappings, sanitize_names, apply_formats, amqp_conn, amqp_exchange):
         self.host = host
         self.mappings = mappings
-        self.use_rates = rates
+        self.sanitize_names = sanitize_names
         self.apply_formats = apply_formats
         self.amqp_conn = amqp_conn
         self.amqp_exchange = amqp_exchange
@@ -124,43 +133,35 @@ class GraphiteAggregator(object):
         self.last_value = {}
         self.last_time = {}
         self.stats_lock = threading.Lock()
-        self.stats = []
+        #self.stats = []
+        self.stats = deque()
 
         update_thread = threading.Thread(target=self.send_updates_thread)
         update_thread.setDaemon(True)
         update_thread.start()
 
     def record_stat(self, values):
+        if self.sanitize_names:
+            #replace periods in metric names with underbars to prevent them
+            #from indicating a tree node in graphite style consumers
+            values['metricname'] = translate(values['metricname'],maketrans('.','_'))
+        #If there is a custom mapping that matches the current metric apply it
+        #otherwise fall back to the default mapping. Any key available in values
+        #dict is valid for substitution. safe_substitue prevents a bad key
+        #from raising an exception and instead just lets the macro through with
+        #no substitution.
         if values['metricname'] in self.mappings['custom_mappings']:
             name = self.mappings['custom_mappings'][name].safe_substitute(values)
         else:
             name = self.mappings['default_mapping'].safe_substitute(values)
-        #name = translate(orig_name,maketrans('_/','..'))
         if self.apply_formats:
             value = values['format'] % values['value']
         else:
             value = values['value']
         now = time.time()
-        if name in self.use_rates:
-            if name not in self.last_value:
-                self.last_value[name] = value
-                self.last_time[name] = now
-                return
-            if value < self.last_value[name]:
-                # counter rollover?
-                self.last_value[name] = value
-                self.last_time[name] = now
-                return
-            rate = (value - self.last_value[name]) / \
-                   (now - self.last_time[name])
-            self.last_value[name] = value
-            self.last_time[name] = now
-            value = rate
-
-        # lock, append to updatequeue name/value, unlock
-        self.stats_lock.acquire()
-        self.stats.append((name, value, now))
-        self.stats_lock.release()
+        #wait on lock to insert
+        with self.stats_lock:
+            self.stats.append((name, value, now))
 
     def send_updates_thread(self):
         while True:
@@ -173,38 +174,38 @@ class GraphiteAggregator(object):
     def send_updates(self):
         if len(self.stats) == 0: return
 
-        self.stats_lock.acquire()
-        stats = self.stats[:]
-        self.stats = []
-        self.stats_lock.release()
+        #We need a lock here since there is no atomic copy/clear
+        with self.stats_lock:
+            stats = list(self.stats)
+            self.stats.clear()
 
         output = []
         for name, value, now in stats:
-            output.append(self._stat(name, value, now))
+            try:
+                msg = self._stat(value, now)
+                print "%s->%s" % (name, msg)
+                msg = amqp.Message(msg)
+                self.amqp_chan.basic_publish(msg, exchange=self.amqp_exchange, routing_key=name)
+            except socket.error as (errno, errstr):
+                print >> sys.stderr, "amqp publish problem: %s" % (errstr,)
+                sys.exit(2)
 
-        print "\n".join(output)
-        msg = amqp.Message("\n".join(output))
-        try:
-            self.amqp_chan.basic_publish(msg, exchange=self.amqp_exchange)
-        except socket.error as (errno, errstr):
-            print >> sys.stderr, "amqp publish problem: %s" % (errstr,)
-            sys.exit(2)
-
-    def _stat(self, name, value, now):
+    def _stat(self, value, now):
         if self.apply_formats:
-            return "%s %s %d" % (name, value, int(now))
+            return "%s %d" % (value, int(now))
         else:
-            return "%s %r %d" % (name, value, int(now))
+            return "%r %d" % (value, int(now))
 
 class McastSocket(socket.socket):
     def __init__(self, bindaddress=None, port=None):
         socket.socket.__init__(self, socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        #if no bindaddress is specified then bind to the interface that the
+        #system hostname resolves to. 
         if bindaddress is None:
             self.intf = socket.gethostbyname(socket.gethostname())
         else:
             self.intf = bindaddress
         self.group = ('', port)
-        #self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(self,'SO_REUSEPORT'):
             self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -213,7 +214,8 @@ class McastSocket(socket.socket):
         try:
             self.bind(self.group)
         except:
-            print "bind failed"
+            #Not sure why this throws an exception sometimes on some platforms
+            #But it seems to work anyways. So lets just ignore that for now.
             pass
 
     def join(self,channel):
@@ -226,6 +228,11 @@ class McastServer(SocketServer.UDPServer):
     def __init__(self, server_address, RequestHandlerClass):
         SocketServer.UDPServer.__init__(self, server_address, RequestHandlerClass)
         self.socket = McastSocket(port=server_address[1])
+        #For some unknown reason all the linux boxes I tested would not allow
+        #reusing the same socket for sending and receiving multicast packets.
+        #OSX didn't have this behavior, but also works with having a second
+        #socket to use for sending.
+        self.socket2 = McastSocket(port=server_address[1])
         self.socket.join(server_address[0])
 
 
@@ -255,11 +262,11 @@ if __name__ == "__main__":
         config.read("/etc/graphlia.ini")
 
     mappings = {}
-    mappings['default_mapping'] = string.Template(config.get("mapping","default", raw=True))
-    mappings['custom_mappings'] = dict([ (metric,string.Template(template)) for
+    mappings['default_mapping'] = Template(config.get("mapping","default", raw=True))
+    mappings['custom_mappings'] = dict([ (metric,Template(template)) for
         (metric,template) in config.items('mapping',raw=True)])
-    use_rates = []
     apply_formats = True
+    sanitize_names = True
 
     amqp_conn = amqp.Connection(host=config.get("amqp", "host"),
                                 userid=config.get("amqp", "user"),
@@ -268,7 +275,7 @@ if __name__ == "__main__":
                                 insist=False)
     amqp_exchange = config.get("amqp", "exchange")
 
-    graphite = GraphiteAggregator(socket.gethostname(), mappings, use_rates,
+    graphite = GraphiteAggregator(socket.gethostname(), mappings, sanitize_names,
             apply_formats, amqp_conn, amqp_exchange)
 
     if config.getboolean("gmond","multicast"):
