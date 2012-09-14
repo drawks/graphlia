@@ -1,10 +1,13 @@
 #!/usr/bin/env python2.6
-
-from amqplib import client_0_8 as amqp
+try:
+    from amqplib import client_0_8 as amqp
+except:
+    pass
 from collections import deque
 from string import translate, maketrans, Template
 from xdrlib import Unpacker, Packer
 import ConfigParser
+import pickle
 import SocketServer
 import socket
 import struct
@@ -15,16 +18,16 @@ import time
 
 GANGLIA_LISTEN_PORT = 8649
 
-magic_nums = { 128 : "metadata",
+magic_nums = {128: "metadata",
 #129 and 130 should be int16/uint16 but since xdr is padded to 4 bytes
 #they don't require sepcial handling afaict.
-    129: lambda x:x.unpack_int(),
-    130: lambda x:x.unpack_uint(),
-    131: lambda x:x.unpack_int(),
-    132: lambda x:x.unpack_uint(),
-    133: lambda x:x.unpack_string(),
-    134: lambda x:x.unpack_float(),
-    135: lambda x:x.unpack_double(),
+    129: lambda x: x.unpack_int(),
+    130: lambda x: x.unpack_uint(),
+    131: lambda x: x.unpack_int(),
+    132: lambda x: x.unpack_uint(),
+    133: lambda x: x.unpack_string(),
+    134: lambda x: x.unpack_float(),
+    135: lambda x: x.unpack_double(),
     136: "metadata request"
     }
 
@@ -47,16 +50,16 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
             #self.unpack_metareq(unpacker)
             return
         elif 128 < packet_type < 136:
-            self.unpack_data(unpacker,packet_type)
+            self.unpack_data(unpacker, packet_type)
             return
         else:
             return
 
-    def unpack_meta(self,unpacker):
+    def unpack_meta(self, unpacker):
         values = {}
         values['hostname'] = unpacker.unpack_string()
         if len(values['hostname'].split(':')) == 2:
-            (values['hostaddr'],values['hostname']) = values['hostname'].split(':')
+            (values['hostaddr'], values['hostname']) = values['hostname'].split(':')
         values['metricname'] = unpacker.unpack_string()
         values['spoof'] = unpacker.unpack_bool()
         values['metrictype'] = unpacker.unpack_string()
@@ -73,15 +76,15 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
             values[k] = v
             i += 1
         unpacker.done()
-        print "Updating metadata for %s on %s" % (values['hostname'],values['metricname'])
-        mdata_hash[(values['hostname'],values['metricname'])] = values
+        print "Updating metadata for %s on %s" % (values['hostname'], values['metricname'])
+        mdata_hash[(values['hostname'], values['metricname'])] = values
         return
 
-    def unpack_data(self,unpacker,packet_type):
+    def unpack_data(self, unpacker, packet_type):
         values = {}
         values['hostname'] = unpacker.unpack_string()
         if len(values['hostname'].split(':')) == 2:
-            (values['hostaddr'],values['hostname']) = values['hostname'].split(':')
+            (values['hostaddr'], values['hostname']) = values['hostname'].split(':')
         values['metricname'] = unpacker.unpack_string()
         values['spoof'] = unpacker.unpack_bool()
         values['format'] = unpacker.unpack_string()
@@ -89,52 +92,65 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         unpacker.done()
         if values['metricname'] == 'heartbeat':
             return
-        elif (values['hostname'],values['metricname']) in mdata_hash:
-            values.update(mdata_hash[(values['hostname'],values['metricname'])])
+        elif (values['hostname'], values['metricname']) in mdata_hash:
+            values.update(mdata_hash[(values['hostname'], values['metricname'])])
             graphite.record_stat(values)
             return
         else:
-            print "Requesting metadata for %s on %s"  % (values['hostname'],values['metricname'])
+            print "Requesting metadata for %s on %s" % (values['hostname'], values['metricname'])
             self.send_metareq(values)
             return
 
-    def unpack_metareq(self,unpacker):
+    def unpack_metareq(self, unpacker):
         values = {}
-        values['hostname']=unpacker.unpack_string()
-        values['metricname']=unpacker.unpack_string()
-        values['spoof']=unpacker.unpack_bool()
+        values['hostname'] = unpacker.unpack_string()
+        values['metricname'] = unpacker.unpack_string()
+        values['spoof'] = unpacker.unpack_bool()
         unpacker.done()
         return
 
-    def send_metareq(self,values):
+    def send_metareq(self, values):
         sock = self.request[1]
         packer = Packer()
         packer.pack_int(136)
         if not values['spoof']:
             packer.pack_string(self.client_address[0])
         else:
-            packer.pack_string(":".join((self.client_address[0],values['hostname'])))
+            packer.pack_string(":".join((self.client_address[0], values['hostname'])))
         packer.pack_string(values['metricname'])
         packer.pack_bool(values['spoof'])
-        self.server.socket2.sendto(packer.get_buffer(),socket.MSG_EOR,self.server.server_address)
+        self.server.socket2.sendto(packer.get_buffer(), socket.MSG_EOR, self.server.server_address)
         return
 
 
 class GraphiteAggregator(object):
-    def __init__(self, host, mappings, sanitize_names, apply_formats, amqp_conn, amqp_exchange):
+    def __init__(self, host, mappings, sanitize_names, apply_formats,
+            amqp_spec=(None, None), carbon_spec=(None, None)):
+        self.carbon_spec = carbon_spec
         self.host = host
         self.mappings = mappings
         self.sanitize_names = sanitize_names
         self.apply_formats = apply_formats
-        self.amqp_conn = amqp_conn
-        self.amqp_exchange = amqp_exchange
-        self.amqp_chan = self.amqp_conn.channel()
+        self.amqp_conn = amqp_spec[0]
+        self.amqp_exchange = amqp_spec[1]
+        if carbon_spec[0] and carbon_spec[1]:
+            self.carbon = True
+            self.carbon_queue = []
+            self.carbon_messages = []
+        else:
+            self.carbon = False
+        if amqp_spec[0] and amqp_spec[1]:
+            self.amqp = True
+            self.amqp_queue = []
+            self.amqp_chan = self.amqp_conn.channel()
+        else:
+            self.amqp = False
 
         self.last_value = {}
         self.last_time = {}
         self.stats_lock = threading.Lock()
-        #self.stats = []
-        self.stats = deque()
+        self.stats = {}
+        #self.stats = deque()
 
         update_thread = threading.Thread(target=self.send_updates_thread)
         update_thread.setDaemon(True)
@@ -144,7 +160,7 @@ class GraphiteAggregator(object):
         if self.sanitize_names:
             #replace periods in metric names with underbars to prevent them
             #from indicating a tree node in graphite style consumers
-            values['metricname'] = translate(values['metricname'],maketrans('.','_'))
+            values['metricname'] = translate(values['metricname'], maketrans('.', '_'))
         #If there is a custom mapping that matches the current metric apply it
         #otherwise fall back to the default mapping. Any key available in values
         #dict is valid for substitution. safe_substitue prevents a bad key
@@ -158,32 +174,80 @@ class GraphiteAggregator(object):
             value = values['format'] % values['value']
         else:
             value = values['value']
-        now = time.time()
+        now = int(time.time())
         #wait on lock to insert
         with self.stats_lock:
-            self.stats.append((name, value, now))
+            self.stats[(values['hostname'], values['metricname'])] = (name, now, value)
 
     def send_updates_thread(self):
         while True:
-            time.sleep(10)
+            t = time.time()
             try:
-                self.send_updates()
+                with self.stats_lock:
+                    working_set = self.cull_stats()
+                    if self.carbon:
+                        self.carbon_queue.extend(working_set)
+                    if self.amqp:
+                        self.amqp_queue.extend(working_set)
+                if self.amqp:
+                    self.send_amqp()
+                if self.carbon:
+                    self.send_carbon()
             except Exception as e:
                 print >>sys.stderr, "Error sending updates: %s" % (e,)
+            #send no more than twice a minute
+            time.sleep(30 - (time.time() - t))
 
-    def send_updates(self):
-        if len(self.stats) == 0: return
+    def cull_stats(self):
+        now = int(time.time())
+        for item in self.stats.items():
+            name = item[0]
+            if now - self.stats[name][1] > mdata_hash[name]['tmax']:
+                print('Dropping stale metric %s on %s' % name)
+                del(self.stats[name])
+        return [(stat[0], (now, stat[2])) for stat in self.stats.values()]
 
-        #We need a lock here since there is no atomic copy/clear
-        with self.stats_lock:
-            stats = list(self.stats)
-            self.stats.clear()
+    def send_carbon(self):
+        data = []
+        print('Preparing %d metric updates' % len(self.carbon_queue))
+        while self.carbon_queue:
+            data.append(self.carbon_queue[:10000])
+            del(self.carbon_queue[:10000])
+        for chunk in data:
+            serializedData = pickle.dumps(chunk, protocol=-1)
+            prefix = struct.pack("!L", len(serializedData))
+            self.carbon_messages.append(prefix + serializedData)
+        try:
+            connected = False
+            sock = socket.create_connection(self.carbon_spec, timeout=5)
+            connected = True
+            num_messages = len(self.carbon_messages)
+            print('Connected to carbon')
+            print('Sending metrics in %d chunks' % num_messages)
+            i = 0
+            while self.carbon_messages:
+                i += 1
+                sock.sendall(self.carbon_messages[0])
+                del(self.carbon_messages[0])
+                print('Sent %d/%d' % (i, num_messages))
+        except socket.timeout:
+            print('Timed out while attempt to connect to %s:%r' % self.carbon_spec)
+        except socket.error:
+            print('Problem while sending to %s:%d' % self.carbon_spec)
+        finally:
+            if self.carbon_messages:
+                print("Queued %d messages for later delivery" % len(self.carbon_messages))
+            if connected:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                    sock.close()
+                except:
+                    pass
 
-        output = []
-        for name, value, now in stats:
+    def send_amqp(self):
+        for (name, (now, value)) in self.amqp_queue:
             try:
                 msg = self._stat(value, now)
-                print "%s->%s" % (name, msg)
                 msg = amqp.Message(msg)
                 self.amqp_chan.basic_publish(msg, exchange=self.amqp_exchange, routing_key=name)
             except socket.error as (errno, errstr):
@@ -196,18 +260,19 @@ class GraphiteAggregator(object):
         else:
             return "%r %d" % (value, int(now))
 
+
 class McastSocket(socket.socket):
     def __init__(self, bindaddress=None, port=None):
         socket.socket.__init__(self, socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         #if no bindaddress is specified then bind to the interface that the
-        #system hostname resolves to. 
+        #system hostname resolves to.
         if bindaddress is None:
             self.intf = socket.gethostbyname(socket.gethostname())
         else:
             self.intf = bindaddress
         self.group = ('', port)
         self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(self,'SO_REUSEPORT'):
+        if hasattr(self, 'SO_REUSEPORT'):
             self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_TTL, 255)
         self.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_LOOP, 1)
@@ -218,9 +283,10 @@ class McastSocket(socket.socket):
             #But it seems to work anyways. So lets just ignore that for now.
             pass
 
-    def join(self,channel):
+    def join(self, channel):
         self.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.intf) + socket.inet_aton('0.0.0.0'))
         self.setsockopt(socket.SOL_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(channel) + socket.inet_aton('0.0.0.0'))
+
 
 class McastServer(SocketServer.UDPServer):
     allow_reuse_address = True
@@ -245,6 +311,12 @@ if __name__ == "__main__":
     pass = guest
     vhost = /
     exchange = stats
+    enable = True
+
+    [carbon]
+    host = localhost
+    port = 2004
+    enable =False
 
     [gmond]
     multicast = True
@@ -262,21 +334,33 @@ if __name__ == "__main__":
         config.read("/etc/graphlia.ini")
 
     mappings = {}
-    mappings['default_mapping'] = Template(config.get("mapping","default", raw=True))
-    mappings['custom_mappings'] = dict([ (metric,Template(template)) for
-        (metric,template) in config.items('mapping',raw=True)])
+    mappings['default_mapping'] = Template(config.get("mapping", "default", raw=True))
+    mappings['custom_mappings'] = dict([(metric, Template(template)) for
+        (metric, template) in config.items('mapping', raw=True)])
     apply_formats = True
     sanitize_names = True
 
-    amqp_conn = amqp.Connection(host=config.get("amqp", "host"),
-                                userid=config.get("amqp", "user"),
-                                password=config.get("amqp", "pass"),
-                                virtual_host=config.get("amqp", "vhost"),
-                                insist=False)
-    amqp_exchange = config.get("amqp", "exchange")
+    if config.getboolean("amqp", "enable"):
+        amqp_conn = amqp.Connection(host=config.get("amqp", "host"),
+                                    userid=config.get("amqp", "user"),
+                                    password=config.get("amqp", "pass"),
+                                    virtual_host=config.get("amqp", "vhost"),
+                                    insist=False)
+        amqp_exchange = config.get("amqp", "exchange")
+        amqp_spec = (amqp_conn, amqp_exchange)
+    else:
+        amqp_spec = (None, None)
+
+    if config.getboolean("carbon", "enable"):
+        carbon_host = config.get("carbon", "host")
+        carbon_port = config.get("carbon", "port")
+        carbon_spec = (carbon_host, carbon_port)
+    else:
+        carbon_spec = (None, None)
+
 
     graphite = GraphiteAggregator(socket.gethostname(), mappings, sanitize_names,
-            apply_formats, amqp_conn, amqp_exchange)
+            apply_formats, amqp_spec, carbon_spec)
 
     if config.getboolean("gmond","multicast"):
         server = McastServer((config.get("gmond","ip"),
