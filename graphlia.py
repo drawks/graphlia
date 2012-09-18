@@ -1,8 +1,3 @@
-#!/usr/bin/env python2.6
-try:
-    from amqplib import client_0_8 as amqp
-except:
-    pass
 from collections import deque
 from string import translate, maketrans, Template
 from xdrlib import Unpacker, Packer
@@ -14,9 +9,8 @@ import struct
 import sys
 import threading
 import time
-
-
-GANGLIA_LISTEN_PORT = 8649
+from twisted.internet.protocol import DatagramProtocol
+from twisted.internet import reactor
 
 magic_nums = {128: "metadata",
 #129 and 130 should be int16/uint16 but since xdr is padded to 4 bytes
@@ -33,12 +27,25 @@ magic_nums = {128: "metadata",
 
 mdata_hash = {}
 
+class GangliaClient(DatagramProtocol):
+    def __init__(self, mcast_group='239.2.11.71', mcast_port=8649, ttl=5, *args, **kwargs):
+        self.mcast_group = mcast_group
+        self.mcast_port = mcast_port
+        self.ttl = ttl
+        #DatagramProtocol.__init__(self, *args, **kwargs)
 
-class GangliaCollector(SocketServer.BaseRequestHandler):
-    def handle(self):
-        data = self.request[0]
+    def startProtocol(self):
+        """
+        Called after protocol has started listening.
+        """
+        # Set the TTL>1 so multicast will cross router hops:
+        self.transport.setTTL(self.ttl)
+        # Join a specific multicast group:
+        self.transport.joinGroup(self.mcast_group)
+
+    def datagramReceived(self, datagram, address):
         values = dict()
-        unpacker = Unpacker(data)
+        unpacker = Unpacker(datagram)
         packet_type = unpacker.unpack_uint()
         if packet_type == 128:
             self.unpack_meta(unpacker)
@@ -50,7 +57,7 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
             #self.unpack_metareq(unpacker)
             return
         elif 128 < packet_type < 136:
-            self.unpack_data(unpacker, packet_type)
+            self.unpack_data(unpacker, packet_type, address)
             return
         else:
             return
@@ -80,7 +87,7 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         mdata_hash[(values['hostname'], values['metricname'])] = values
         return
 
-    def unpack_data(self, unpacker, packet_type):
+    def unpack_data(self, unpacker, packet_type, address):
         values = {}
         values['hostname'] = unpacker.unpack_string()
         if len(values['hostname'].split(':')) == 2:
@@ -94,11 +101,12 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
             return
         elif (values['hostname'], values['metricname']) in mdata_hash:
             values.update(mdata_hash[(values['hostname'], values['metricname'])])
+            #print values
             graphite.record_stat(values)
             return
         else:
             print "Requesting metadata for %s on %s" % (values['hostname'], values['metricname'])
-            self.send_metareq(values)
+            self.send_metareq(values, (self.mcast_group,self.mcast_port))
             return
 
     def unpack_metareq(self, unpacker):
@@ -109,18 +117,19 @@ class GangliaCollector(SocketServer.BaseRequestHandler):
         unpacker.done()
         return
 
-    def send_metareq(self, values):
-        sock = self.request[1]
+    def send_metareq(self, values, address):
         packer = Packer()
         packer.pack_int(136)
         if not values['spoof']:
-            packer.pack_string(self.client_address[0])
+            packer.pack_string(address[0])
         else:
-            packer.pack_string(":".join((self.client_address[0], values['hostname'])))
+            packer.pack_string(":".join((address[0], values['hostname'])))
         packer.pack_string(values['metricname'])
         packer.pack_bool(values['spoof'])
-        self.server.socket2.sendto(packer.get_buffer(), socket.MSG_EOR, self.server.server_address)
+        self.transport.write(packer.get_buffer(),address)
         return
+
+
 
 
 class GraphiteAggregator(object):
@@ -261,47 +270,6 @@ class GraphiteAggregator(object):
             return "%r %d" % (value, int(now))
 
 
-class McastSocket(socket.socket):
-    def __init__(self, bindaddress=None, port=None):
-        socket.socket.__init__(self, socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        #if no bindaddress is specified then bind to the interface that the
-        #system hostname resolves to.
-        if bindaddress is None:
-            self.intf = socket.gethostbyname(socket.gethostname())
-        else:
-            self.intf = bindaddress
-        self.group = ('', port)
-        self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(self, 'SO_REUSEPORT'):
-            self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_TTL, 255)
-        self.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_LOOP, 1)
-        try:
-            self.bind(self.group)
-        except:
-            #Not sure why this throws an exception sometimes on some platforms
-            #But it seems to work anyways. So lets just ignore that for now.
-            pass
-
-    def join(self, channel):
-        self.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.intf) + socket.inet_aton('0.0.0.0'))
-        self.setsockopt(socket.SOL_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(channel) + socket.inet_aton('0.0.0.0'))
-
-
-class McastServer(SocketServer.UDPServer):
-    allow_reuse_address = True
-
-    def __init__(self, server_address, RequestHandlerClass):
-        SocketServer.UDPServer.__init__(self, server_address, RequestHandlerClass)
-        self.socket = McastSocket(port=server_address[1])
-        #For some unknown reason all the linux boxes I tested would not allow
-        #reusing the same socket for sending and receiving multicast packets.
-        #OSX didn't have this behavior, but also works with having a second
-        #socket to use for sending.
-        self.socket2 = McastSocket(port=server_address[1])
-        self.socket.join(server_address[0])
-
-
 if __name__ == "__main__":
 
     default_config = '''
@@ -363,10 +331,12 @@ if __name__ == "__main__":
             apply_formats, amqp_spec, carbon_spec)
 
     if config.getboolean("gmond","multicast"):
-        server = McastServer((config.get("gmond","ip"),
-            config.getint("gmond","port")), GangliaCollector)
-    else:
-        server = SocketServer.UDPServer((config.get("gmond","ip"),
-            config.getint("gmond","port")), GangliaCollector)
+        #server = McastServer((config.get("gmond","ip"),
+        #    config.getint("gmond","port")), GangliaCollector)
+        reactor.listenMulticast(config.getint("gmond","port"), GangliaClient(),
+                        listenMultiple=True)
+reactor.run()
+#    else:
+#        server = SocketServer.UDPServer((config.get("gmond","ip"),
+#            config.getint("gmond","port")), GangliaCollector)
 
-    server.serve_forever()
